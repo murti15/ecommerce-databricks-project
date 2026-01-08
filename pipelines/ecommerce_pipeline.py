@@ -1,27 +1,31 @@
-# =========================================================
-# E-COMMERCE DATA PIPELINE
-# Bronze → Silver → Gold Architecture
-# Technology: PySpark + Delta Lake (Azure Databricks style)
-# =========================================================
+# ===============================
+# STEP 0: Spark + Delta Setup
+# ===============================
 
-
-# =========================================================
-# STEP 0: SOURCE DATA (SIMULATED INGESTION)
-# In real projects: ADLS / Blob / EventHub / Kafka
-# =========================================================
-
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sum
 from pyspark.sql.types import *
-from pyspark.sql.functions import *
 
-# Sample order data
+# IMPORTANT: Create Spark Session (CI + Local)
+spark = SparkSession.builder \
+    .appName("Ecommerce Bronze Silver Gold Pipeline") \
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
+    .getOrCreate()
+
+print("Spark Version:", spark.version)
+
+# ===============================
+# STEP 1: SOURCE DATA
+# ===============================
+
 data = [
     (1, "C1", "P1", 2, 500, "2025-01-01", "PLACED"),
-    (2, "C2", "P2", 1, -200, "2025-01-01", "PLACED"),     # invalid amount
-    (3, "C3", "P1", 1, 300, "2025-01-02", "CANCELLED"),  # cancelled order
+    (2, "C2", "P2", 1, -200, "2025-01-01", "PLACED"),
+    (3, "C3", "P1", 1, 300, "2025-01-02", "CANCELLED"),
     (4, "C4", "P3", 3, 900, "2025-01-02", "PLACED")
 ]
 
-# Define schema
 schema = StructType([
     StructField("order_id", IntegerType()),
     StructField("customer_id", StringType()),
@@ -32,70 +36,38 @@ schema = StructType([
     StructField("status", StringType())
 ])
 
-# Create Spark DataFrame
 orders_df = spark.createDataFrame(data, schema)
+orders_df.show()
 
-print("STEP 0: SOURCE DATA")
-display(orders_df)
+# ===============================
+# STEP 2: BRONZE
+# ===============================
 
+orders_df.write.format("delta").mode("overwrite").save("delta/bronze_orders")
+bronze_df = spark.read.format("delta").load("delta/bronze_orders")
+bronze_df.show()
 
-# =========================================================
-# STEP 1: BRONZE LAYER (RAW DATA)
-# Purpose: Store raw, immutable data for audit & replay
-# =========================================================
+# ===============================
+# STEP 3: SILVER
+# ===============================
 
-orders_df.write \
-    .format("delta") \
-    .mode("overwrite") \
-    .saveAsTable("bronze_orders")
-
-print("STEP 1: BRONZE TABLE CREATED")
-spark.sql("SELECT * FROM bronze_orders").show()
-
-
-# =========================================================
-# STEP 2: SILVER LAYER (DATA QUALITY + order_value)
-# Rules:
-#   - amount must be > 0
-#   - status must be PLACED
-# Derived Column:
-#   - order_value = qty * amount
-# =========================================================
-
-silver_df = spark.table("bronze_orders") \
-    .filter("amount > 0") \
-    .filter("status = 'PLACED'") \
+silver_df = bronze_df \
+    .filter(col("amount") > 0) \
+    .filter(col("status") == "PLACED") \
     .withColumn("order_value", col("qty") * col("amount"))
 
-silver_df.write \
-    .format("delta") \
-    .mode("overwrite") \
-    .saveAsTable("silver_orders")
+silver_df.write.format("delta").mode("overwrite").save("delta/silver_orders")
+silver_df.show()
 
-print("STEP 2: SILVER TABLE CREATED (DATA QUALITY + order_value)")
-spark.sql("SELECT * FROM silver_orders").show()
+# ===============================
+# STEP 4: GOLD
+# ===============================
 
-
-# =========================================================
-# STEP 3: GOLD LAYER (BUSINESS AGGREGATION)
-# Business Metric:
-#   - Total revenue per day
-# =========================================================
-
-gold_df = spark.table("silver_orders") \
+gold_df = silver_df \
     .groupBy("order_date") \
     .agg(sum("order_value").alias("total_revenue"))
 
-gold_df.write \
-    .format("delta") \
-    .mode("overwrite") \
-    .saveAsTable("gold_order_revenue")
+gold_df.write.format("delta").mode("overwrite").save("delta/gold_order_revenue")
+gold_df.show()
 
-print("STEP 3: GOLD TABLE CREATED (BUSINESS METRICS)")
-spark.sql("SELECT * FROM gold_order_revenue").show()
-
-
-# =========================================================
-# END OF PIPELINE
-# =========================================================
-print("✅ Pipeline Execution Complete!")
+spark.stop()
